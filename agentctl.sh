@@ -19,6 +19,7 @@ Usage:
   agentctl delete <agent_name> [--force]
   agentctl rename <old_name> <new_name>
   agentctl refresh-context [agent_name] [repo_name]
+  agentctl sync-config [config_name] [--region <aws_region>]
 EOF
 }
 
@@ -160,9 +161,175 @@ refresh_context() {
     done
   done
 
-  echo "Refreshed context in $updated repo worktrees."
+echo "Refreshed context in $updated repo worktrees."
 }
 
+remote_config_name_file() {
+  echo "${HOME}/.config/agentctl/remote_config_name"
+}
+
+detect_aws_region() {
+  local forced_region="${1:-}"
+  if [[ -n "${forced_region:-}" ]]; then
+    echo "$forced_region"
+    return 0
+  fi
+
+  if [[ -n "${AWS_REGION:-}" ]]; then
+    echo "$AWS_REGION"
+    return 0
+  fi
+  if [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+    echo "$AWS_DEFAULT_REGION"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local doc
+  doc="$(curl -fsSL http://169.254.169.254/latest/dynamic/instance-identity/document 2>/dev/null || true)"
+  [[ -n "${doc:-}" ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - <<'PY' <<<"$doc"
+import json,sys
+print(json.load(sys.stdin)["region"])
+PY
+    return 0
+  fi
+
+  if command -v jq >/dev/null 2>&1; then
+    echo "$doc" | jq -r '.region'
+    return 0
+  fi
+
+  return 1
+}
+
+sync_config() {
+  # Usage:
+  #   agentctl sync-config
+  #   agentctl sync-config <config_name>
+  #   agentctl sync-config <config_name> --region us-east-1
+
+  local config_name=""
+  local region=""
+
+  # Parse args
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --region)
+        region="$2"; shift 2 ;;
+      -h|--help)
+        usage; return 0 ;;
+      *)
+        if [[ -z "$config_name" ]]; then
+          config_name="$1"; shift 1
+        else
+          echo "Unknown arg: $1" >&2
+          usage
+          return 2
+        fi
+        ;;
+    esac
+  done
+
+  if [[ -z "${config_name:-}" ]]; then
+    # Try to read last-used name
+    local name_file
+    name_file="$(remote_config_name_file)"
+    if [[ -f "$name_file" ]]; then
+      config_name="$(cat "$name_file" | tr -d ' \t\n\r')"
+    fi
+  fi
+
+  if [[ -z "${config_name:-}" && -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
+    config_name="$AGENT_HOST_CONFIG_NAME"
+  fi
+
+  if [[ -z "${config_name:-}" ]]; then
+    echo "Missing config name." >&2
+    echo "Provide one: agentctl sync-config <config_name>" >&2
+    return 2
+  fi
+
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "aws CLI not found. Install awscli (bootstrap installs it)." >&2
+    return 1
+  fi
+
+  if ! region="$(detect_aws_region "$region")"; then
+    echo "Could not detect AWS region (pass --region or set AWS_REGION)." >&2
+    return 1
+  fi
+
+  local secret_id="agent-host/${config_name}/bitbucket_ssh_private_key"
+  local param_name="/agent-host/${config_name}/agentctl/repos_txt"
+
+  echo "Syncing remote config: name=$config_name region=$region"
+
+  mkdir -p "${HOME}/.ssh" "${HOME}/.config/agentctl"
+  chmod 0700 "${HOME}/.ssh" || true
+
+  # 1) Fetch and write the Bitbucket SSH private key.
+  local secret_bin secret_str
+  secret_bin="$(aws --region "$region" secretsmanager get-secret-value \
+    --secret-id "$secret_id" \
+    --query SecretBinary --output text 2>/dev/null || true)"
+
+  if [[ -n "${secret_bin:-}" && "$secret_bin" != "None" ]]; then
+    if command -v base64 >/dev/null 2>&1; then
+      echo "$secret_bin" | base64 -d >"${HOME}/.ssh/id_ed25519"
+    else
+      python3 - <<'PY' <<<"$secret_bin" >"${HOME}/.ssh/id_ed25519"
+import base64,sys
+sys.stdout.buffer.write(base64.b64decode(sys.stdin.read().strip()))
+PY
+    fi
+  else
+    secret_str="$(aws --region "$region" secretsmanager get-secret-value \
+      --secret-id "$secret_id" \
+      --query SecretString --output text)"
+    [[ -n "${secret_str:-}" && "$secret_str" != "None" ]] || { echo "Failed to read secret: $secret_id" >&2; return 1; }
+    printf '%s\n' "$secret_str" >"${HOME}/.ssh/id_ed25519"
+  fi
+
+  chmod 0600 "${HOME}/.ssh/id_ed25519"
+
+  # Ensure ssh uses this key for Bitbucket.
+  if [[ ! -f "${HOME}/.ssh/config" ]] || ! grep -q "^Host bitbucket\.org$" "${HOME}/.ssh/config"; then
+    cat >>"${HOME}/.ssh/config" <<'EOF'
+Host bitbucket.org
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+EOF
+    chmod 0600 "${HOME}/.ssh/config" || true
+  fi
+
+  # Seed known_hosts to avoid prompts.
+  ssh-keygen -F bitbucket.org >/dev/null 2>&1 || ssh-keyscan -t rsa,ed25519 bitbucket.org >> "${HOME}/.ssh/known_hosts" 2>/dev/null || true
+  chmod 0644 "${HOME}/.ssh/known_hosts" 2>/dev/null || true
+
+  # 2) Fetch and write repos.txt.
+  aws --region "$region" ssm get-parameter \
+    --name "$param_name" \
+    --with-decryption \
+    --query Parameter.Value --output text \
+    >"${HOME}/.config/agentctl/repos.txt"
+
+  chmod 0644 "${HOME}/.config/agentctl/repos.txt" || true
+
+  # 3) Persist last-used config name for convenience.
+  echo "$config_name" >"$(remote_config_name_file)"
+  chmod 0644 "$(remote_config_name_file)" || true
+
+  echo "Synced:"
+  echo "  - SSH key: ${HOME}/.ssh/id_ed25519 (from $secret_id)"
+  echo "  - repos:   ${HOME}/.config/agentctl/repos.txt (from $param_name)"
+  return 0
+}
 
 list_repos() {
   if [[ ! -f "$REPO_FILE" ]]; then
@@ -526,6 +693,11 @@ case "$cmd" in
   refresh-context)
     [[ $# -le 3 ]] || usage
     refresh_context "${2:-}" "${3:-}"
+    ;;
+  sync-config)
+    # agentctl sync-config [config_name] [--region us-east-1]
+    shift
+    sync_config "$@"
     ;;
   *)
     usage

@@ -123,6 +123,13 @@ Behavior:
   - `0`: log a warning and continue
 - `REMOTE_CONFIG_AWS_REGION` (optional): force the region used for AWS CLI calls
 
+Post-launch syncing:
+- You can apply (or switch) the remote config after the instance is already running:
+  - `sudo -i -u agent agentctl sync-config joey-agents --region us-east-1`
+- If the bootstrap applied remote config at boot time, it writes the last-used name to:
+  - `/home/agent/.config/agentctl/remote_config_name`
+  Then you can run `agentctl sync-config` with no args.
+
 Important:
 - This is an AWS account + region setup (Secrets Manager and SSM Parameter Store are region-scoped).
 - Instances fetch these values via their instance profile (IAM role).
@@ -178,6 +185,9 @@ agentctl create-agent <agent_name>
 agentctl start <agent_name>
 agentctl list-agents
 agentctl list-repos
+
+# Pull Bitbucket SSH key + repos.txt from AWS (optional remote config)
+agentctl sync-config [config_name] [--region us-east-1]
 ```
 
 Notes:

@@ -364,10 +364,20 @@ detect_aws_region() {
     return 1
   fi
 
-  python3 - <<'PY' <<<"$doc"
-import json,sys
-print(json.load(sys.stdin)["region"])
-PY
+  local region
+
+  # jq is installed in install_base(). Prefer it here.
+  if command -v jq >/dev/null 2>&1; then
+    region="$(echo "$doc" | jq -r '.region // empty' 2>/dev/null || true)"
+  else
+    region="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("region", ""))' "$doc" 2>/dev/null || true)"
+  fi
+
+  if [[ -z "${region:-}" ]]; then
+    return 1
+  fi
+
+  echo "$region"
   return 0
 }
 
