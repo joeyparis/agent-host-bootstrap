@@ -177,6 +177,55 @@ mount_srv() {
 ################################################################################
 # 3) Base OS packages + agent user
 ################################################################################
+install_awscli() {
+  if command -v aws >/dev/null 2>&1; then
+    return 0
+  fi
+
+  log "Installing AWS CLI (required for remote config if enabled)..."
+
+  # On Ubuntu, awscli is commonly in the 'universe' component.
+  if [[ -r /etc/os-release ]] && grep -q '^ID=ubuntu' /etc/os-release; then
+    apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    if command -v add-apt-repository >/dev/null 2>&1; then
+      add-apt-repository -y universe >/dev/null 2>&1 || true
+      apt-get update
+    fi
+  fi
+
+  # Try apt first.
+  if apt-get install -y awscli >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Fallback: AWS CLI v2 installer (works even when apt lacks awscli).
+  local arch pkg
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64)
+      pkg="awscli-exe-linux-x86_64.zip"
+      ;;
+    aarch64|arm64)
+      pkg="awscli-exe-linux-aarch64.zip"
+      ;;
+    *)
+      die "Unsupported architecture for AWS CLI v2 install: $arch"
+      ;;
+  esac
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+
+  log "Downloading AWS CLI v2 ($pkg)..."
+  curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 10 "https://awscli.amazonaws.com/${pkg}" -o "${tmp_dir}/awscliv2.zip"
+  unzip -q "${tmp_dir}/awscliv2.zip" -d "$tmp_dir"
+  "${tmp_dir}/aws/install" --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update
+
+  rm -rf "$tmp_dir"
+
+  command -v aws >/dev/null 2>&1 || die "AWS CLI install failed"
+}
+
 install_base() {
   log "Installing base packages..."
   export DEBIAN_FRONTEND=noninteractive
@@ -184,7 +233,9 @@ install_base() {
   apt-get install -y \
     tmux git zsh curl ca-certificates gnupg jq unzip ripgrep \
     build-essential python3 python3-pip \
-    openssh-client awscli
+    openssh-client
+
+  install_awscli
 
   log "Creating agent user (passwordless sudo)..."
   if ! id -u agent >/dev/null 2>&1; then
@@ -442,6 +493,14 @@ maybe_load_remote_config() {
 
   if [[ "$ok" -eq 1 ]]; then
     log "Remote config applied."
+
+    # Persist the config name for later use (e.g. agentctl sync-config with no args).
+    if [[ -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
+      install -d -m 0755 -o agent -g agent /home/agent/.config/agentctl
+      echo "$AGENT_HOST_CONFIG_NAME" > /home/agent/.config/agentctl/remote_config_name
+      chown agent:agent /home/agent/.config/agentctl/remote_config_name
+      chmod 0644 /home/agent/.config/agentctl/remote_config_name
+    fi
   fi
 
   return 0
