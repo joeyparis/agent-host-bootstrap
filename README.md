@@ -21,6 +21,42 @@ This repo contains a hardened EC2 user-data bootstrap script (`bootstrap.sh`) an
 3) Provide an additional EBS volume if you want `/srv` mounted on a data disk.
 4) Set `bootstrap.sh` as your user-data (or curl it from your repo and execute it).
 
+### Launch Template / cloud-init example (recommended)
+A common pattern is to use cloud-init `#cloud-config` user-data to download and run the bootstrap.
+
+Example:
+```yaml
+#cloud-config
+package_update: true
+packages:
+  - curl
+  - ca-certificates
+
+runcmd:
+  - bash -lc 'mkdir -p /opt/agent-host'
+  - bash -lc 'curl -fsSL https://raw.githubusercontent.com/joeyparis/agent-host-bootstrap/main/bootstrap.sh -o /opt/agent-host/bootstrap.sh'
+  - bash -lc 'chmod +x /opt/agent-host/bootstrap.sh'
+  - bash -lc '/opt/agent-host/bootstrap.sh'
+```
+
+Important:
+- Each `runcmd` entry runs in its own process.
+- If you want to pass environment variables (like `AGENT_HOST_CONFIG_NAME`), do it in the SAME command that runs the script.
+
+### Setting the remote config name in cloud-init
+To enable remote config for a specific deployment, set `AGENT_HOST_CONFIG_NAME` when you run the bootstrap:
+
+```yaml
+runcmd:
+  - bash -lc 'AGENT_HOST_CONFIG_NAME=prod /opt/agent-host/bootstrap.sh'
+```
+
+If you also want strict behavior (fail boot if config fetch fails):
+```yaml
+runcmd:
+  - bash -lc 'AGENT_HOST_CONFIG_NAME=prod REQUIRE_REMOTE_CONFIG=1 /opt/agent-host/bootstrap.sh'
+```
+
 On first boot, the instance should:
 - mount `/srv` (if a data disk is detected)
 - install packages
@@ -97,6 +133,17 @@ Required IAM permissions on the instance role:
 - plus `kms:Decrypt` if you use customer-managed KMS keys
 
 Example setup (run from a workstation/CI with AWS creds):
+
+Option A: use the helper script in this repo:
+```bash
+scripts/create_agent_host_remote_config.sh \
+  --name my-config \
+  --region us-east-1 \
+  --ssh-key-file ./id_ed25519 \
+  --repos-file ./repos.txt
+```
+
+Option B: run raw AWS CLI commands:
 ```bash
 # Choose a config name (e.g. prod, staging, joey)
 CFG=my-config
