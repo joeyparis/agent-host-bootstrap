@@ -110,7 +110,7 @@ install_base() {
   apt-get update
   apt-get install -y \
     tmux git zsh curl ca-certificates gnupg jq unzip ripgrep \
-    build-essential python3 python3-pip awscli
+    build-essential python3 python3-pip
 
   log "Creating agent user (passwordless sudo)..."
   if ! id -u agent >/dev/null 2>&1; then
