@@ -52,6 +52,9 @@ ensure_agent_user() {
 
 ensure_session() {
   tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION" -n "hub"
+
+  # Ensure tmux server/session inherits the current PATH (helps when CLIs are installed under ~/.npm-global).
+  tmux set-environment -t "$SESSION" PATH "$PATH" 2>/dev/null || true
 }
 
 agent_paths() {
