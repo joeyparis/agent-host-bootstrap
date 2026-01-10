@@ -193,6 +193,12 @@ agentctl sync-config [config_name] [--region us-east-1]
 Notes:
 - `agentctl` is designed to run as the `agent` user.
 - tmux windows created by `agentctl` run `bash -l` to ensure readline/history and arrow keys work reliably.
+- Repos are cached under `/srv/git-mirrors/<repo>.git` as bare repos and checked out into per-agent worktrees.
+
+Pushing changes:
+- Commit in the worktree (e.g. `/srv/agents/<agent>/work/<repo>`), not inside `/srv/git-mirrors`.
+- Safest push form:
+  - `git push origin HEAD`
 
 ### tmux quick reference
 `agentctl` uses tmux to manage a single session (default name: `agents`) with one window per agent.

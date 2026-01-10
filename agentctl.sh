@@ -452,9 +452,18 @@ create_worktree() {
       echo "Unknown repo: $repo_name (add it to $REPO_FILE)"
       exit 1
     fi
-    echo "Mirror missing, creating: $repo_name"
-    git clone --mirror "$url" "$mirror"
+
+    # Use a bare repo as a shared local cache.
+    # Avoid `--mirror` here: mirror clones can make `git push` behave dangerously by mirroring refs.
+    echo "Mirror missing, creating (bare): $repo_name"
+    git clone --bare "$url" "$mirror"
+
+    # Belt-and-suspenders: ensure we never treat origin as a mirror.
+    git -C "$mirror" config --bool remote.origin.mirror false || true
   else
+    # If this mirror was created previously with `--mirror`, disable mirror-push semantics.
+    git -C "$mirror" config --bool remote.origin.mirror false || true
+
     # Keep mirror fresh enough for normal use
     git -C "$mirror" remote update --prune
   fi
@@ -495,6 +504,9 @@ create_worktree() {
 
   echo "Creating worktree: agent=$agent_name repo=$repo_name branch=$branch_name"
   git -C "$mirror" worktree add -B "$branch_name" "$workdir" "$base_ref"
+
+  # Safer push behavior from worktrees (avoid surprising refspec pushes).
+  git -C "$workdir" config push.default simple >/dev/null 2>&1 || true
 
   echo "Worktree ready: $workdir"
 
