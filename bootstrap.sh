@@ -31,38 +31,31 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 # 1) Find the data device (prefer /dev/sdb)
 ################################################################################
 find_data_device() {
-  if [[ -b "$DATA_DEV_PRIMARY" ]]; then
-    echo "$DATA_DEV_PRIMARY"
+  # Prefer the explicit mapping you asked for
+  if [[ -b /dev/sdb ]]; then
+    echo /dev/sdb
+    return 0
+  fi
+  if [[ -b /dev/xvdb ]]; then
+    echo /dev/xvdb
     return 0
   fi
 
-  for d in "${DATA_DEV_FALLBACKS[@]}"; do
-    if [[ -b "$d" ]]; then
-      echo "$d"
-      return 0
-    fi
-  done
-
-  # Try to discover a likely non-root disk if /dev/sdb isn't present
-  # This is a last resort safety net.
-  local root_src root_base
+  # Nitro: find first non-root nvme disk (root is usually nvme0n1, data often nvme1n1)
+  local root_src root_disk
   root_src="$(findmnt -n -o SOURCE / || true)"
-  root_base="$(echo "$root_src" | sed 's/[0-9]*$//')"
+  # root_src could be /dev/nvme0n1p1 -> root_disk /dev/nvme0n1
+  root_disk="$(echo "$root_src" | sed -E 's/p?[0-9]+$//')"
 
-  for d in /dev/nvme*n1 /dev/xvd[b-z] /dev/sd[b-z]; do
+  for d in /dev/nvme*n1; do
     [[ -b "$d" ]] || continue
-    [[ "$d" == "$root_base" ]] && continue
-    # Skip anything already mounted
-    if findmnt -n -S "$d" >/dev/null 2>&1; then
-      continue
-    fi
+    [[ "$d" == "$root_disk" ]] && continue
     echo "$d"
     return 0
   done
 
   return 1
 }
-
 ################################################################################
 # 2) Mount /srv
 ################################################################################
@@ -74,24 +67,34 @@ mount_srv() {
 
   mkdir -p /srv
 
-  local dev
-  if ! dev="$(find_data_device)"; then
-    die "Could not find a data device to mount at /srv. Ensure the instance has an attached EBS volume mapped as /dev/sdb (or equivalent)."
+  local disk
+  if ! disk="$(find_data_device)"; then
+    die "Could not find a data device to mount at /srv. Ensure an EBS data volume is attached (mapped as /dev/sdb)."
   fi
 
-  log "Using data device: $dev"
+  log "Using data disk: $disk"
 
-  # If device is blank (no fs signature), make ext4
-  if ! blkid "$dev" >/dev/null 2>&1; then
-    log "No filesystem detected on $dev, creating ext4..."
-    mkfs.ext4 -F "$dev"
+  # If the disk has partitions, use the first partition; otherwise use the disk itself.
+  local target="$disk"
+  local part
+  part="$(lsblk -nr -o NAME,TYPE "$disk" | awk '$2=="part"{print $1; exit}' || true)"
+  if [[ -n "$part" ]]; then
+    target="/dev/${part}"
+    log "Disk has partitions, using partition: $target"
+  fi
+
+  # If target has no filesystem type, create one.
+  local fstype
+  fstype="$(lsblk -nr -o FSTYPE "$target" | head -n1 | tr -d ' ' || true)"
+  if [[ -z "$fstype" ]]; then
+    log "No filesystem detected on $target, creating ext4..."
+    mkfs.ext4 -F "$target"
   fi
 
   local uuid
-  uuid="$(blkid -s UUID -o value "$dev" || true)"
-  [[ -n "$uuid" ]] || die "Unable to read UUID for $dev"
+  uuid="$(blkid -s UUID -o value "$target" || true)"
+  [[ -n "$uuid" ]] || die "Unable to read filesystem UUID for $target (after mkfs)."
 
-  # Ensure fstab entry exists
   if ! grep -q "UUID=${uuid} /srv " /etc/fstab; then
     log "Adding /srv mount to /etc/fstab"
     echo "UUID=${uuid} /srv ext4 defaults,nofail 0 2" >> /etc/fstab
