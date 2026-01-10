@@ -312,6 +312,8 @@ sanity_checks() {
   log "Done."
   log "Next: sudo -i -u agent"
   log "Then: agentctl session"
+  log "Note: If arrow keys print ^[[A in SSM Session Manager, that's because SSM defaults to /bin/sh." 
+  log "      Fix is an AWS Session Manager preference (account+region). See: scripts/configure_ssm_shell_profile.sh in this repo."
 }
 
 ################################################################################

@@ -51,10 +51,16 @@ ensure_agent_user() {
 }
 
 ensure_session() {
-  tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION" -n "hub"
+  # Force bash login shells in tmux so readline/history and arrow keys work.
+  # tmux defaults to /bin/sh if not configured, which will echo escape sequences like ^[[A.
+  tmux set-option -g default-shell /bin/bash 2>/dev/null || true
+  tmux set-option -g default-command "/bin/bash -l" 2>/dev/null || true
+
+  tmux has-session -t "$SESSION" 2>/dev/null || tmux new-session -d -s "$SESSION" -n "hub" /bin/bash -l
 
   # Ensure tmux server/session inherits the current PATH (helps when CLIs are installed under ~/.npm-global).
   tmux set-environment -t "$SESSION" PATH "$PATH" 2>/dev/null || true
+  tmux set-environment -t "$SESSION" SHELL /bin/bash 2>/dev/null || true
 }
 
 agent_paths() {
@@ -245,7 +251,7 @@ start_agent() {
   if tmux list-windows -t "$SESSION" -F '#W' | grep -qx "$agent_name"; then
     tmux select-window -t "${SESSION}:${agent_name}"
   else
-    tmux new-window -t "$SESSION" -n "$agent_name" -c "$root/work"
+    tmux new-window -t "$SESSION" -n "$agent_name" -c "$root/work" /bin/bash -l
   fi
 
   # Force correct window name even if it existed with a different name
