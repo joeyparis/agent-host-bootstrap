@@ -40,6 +40,27 @@ INSTALL_CODEX_CLI="${INSTALL_CODEX_CLI:-1}"
 INSTALL_GEMINI_CLI="${INSTALL_GEMINI_CLI:-1}"
 INSTALL_CLAUDE_CLI="${INSTALL_CLAUDE_CLI:-1}"
 
+################################################################################
+# CONFIG: optional remote config (persist outside instances)
+################################################################################
+# To enable, set AGENT_HOST_CONFIG_NAME to a non-empty value.
+# This lets you have multiple deployments pointing at different shared configs.
+#
+# Derived defaults when AGENT_HOST_CONFIG_NAME is set:
+#   Secrets Manager (Bitbucket SSH private key): agent-host/<name>/bitbucket_ssh_private_key
+#   SSM Parameter Store (agentctl repos.txt):    /agent-host/<name>/agentctl/repos_txt
+AGENT_HOST_CONFIG_NAME="${AGENT_HOST_CONFIG_NAME:-}"
+
+# Overrides (set these directly if you prefer not to use the derived names).
+BITBUCKET_SSH_KEY_SECRET_ID="${BITBUCKET_SSH_KEY_SECRET_ID:-}"
+AGENTCTL_REPOS_SSM_PARAM_NAME="${AGENTCTL_REPOS_SSM_PARAM_NAME:-}"
+
+# If enabled and this is 1, failing to fetch/apply remote config will fail the bootstrap.
+REQUIRE_REMOTE_CONFIG="${REQUIRE_REMOTE_CONFIG:-1}"
+
+# Optional region override for AWS CLI calls. If unset, bootstrap will attempt to detect region via IMDS.
+REMOTE_CONFIG_AWS_REGION="${REMOTE_CONFIG_AWS_REGION:-}"
+
 raw_url() {
   echo "https://raw.githubusercontent.com/${GITHUB_OWNER}/${GITHUB_REPO}/${GITHUB_REF}/$1"
 }
@@ -162,7 +183,8 @@ install_base() {
   apt-get update
   apt-get install -y \
     tmux git zsh curl ca-certificates gnupg jq unzip ripgrep \
-    build-essential python3 python3-pip
+    build-essential python3 python3-pip \
+    openssh-client awscli
 
   log "Creating agent user (passwordless sudo)..."
   if ! id -u agent >/dev/null 2>&1; then
@@ -250,7 +272,183 @@ install_agent_clis() {
 }
 
 ################################################################################
-# 7) Layout under /srv and install agentctl
+# 7) Optional remote config (repos + Bitbucket SSH key)
+################################################################################
+imds_token() {
+  # IMDSv2 token (best effort). If IMDSv2 is not required, this may be empty.
+  curl -fsSL -X PUT "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" 2>/dev/null || true
+}
+
+imds_get() {
+  local path="$1"
+  local token
+  token="$(imds_token)"
+  if [[ -n "${token:-}" ]]; then
+    curl -fsSL -H "X-aws-ec2-metadata-token: ${token}" "http://169.254.169.254${path}" 2>/dev/null
+  else
+    curl -fsSL "http://169.254.169.254${path}" 2>/dev/null
+  fi
+}
+
+detect_aws_region() {
+  if [[ -n "${REMOTE_CONFIG_AWS_REGION:-}" ]]; then
+    echo "$REMOTE_CONFIG_AWS_REGION"
+    return 0
+  fi
+
+  # Prefer standard env vars if present.
+  if [[ -n "${AWS_REGION:-}" ]]; then
+    echo "$AWS_REGION"
+    return 0
+  fi
+  if [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+    echo "$AWS_DEFAULT_REGION"
+    return 0
+  fi
+
+  local doc
+  doc="$(imds_get /latest/dynamic/instance-identity/document || true)"
+  if [[ -z "${doc:-}" ]]; then
+    return 1
+  fi
+
+  python3 - <<'PY' <<<"$doc"
+import json,sys
+print(json.load(sys.stdin)["region"])
+PY
+  return 0
+}
+
+write_agent_bitbucket_key_from_secret() {
+  local region="$1"
+  local secret_id="$2"
+
+  log "Fetching Bitbucket SSH key from Secrets Manager: $secret_id"
+
+  local secret_bin secret_str
+  secret_bin="$(aws --region "$region" secretsmanager get-secret-value \
+    --secret-id "$secret_id" \
+    --query SecretBinary --output text 2>/dev/null || true)"
+
+  install -d -m 0700 -o agent -g agent /home/agent/.ssh
+
+  if [[ -n "${secret_bin:-}" && "$secret_bin" != "None" ]]; then
+    echo "$secret_bin" | base64 -d > /home/agent/.ssh/id_ed25519
+  else
+    secret_str="$(aws --region "$region" secretsmanager get-secret-value \
+      --secret-id "$secret_id" \
+      --query SecretString --output text)"
+    [[ -n "${secret_str:-}" && "$secret_str" != "None" ]] || return 1
+    printf '%s\n' "$secret_str" > /home/agent/.ssh/id_ed25519
+  fi
+
+  chown agent:agent /home/agent/.ssh/id_ed25519
+  chmod 0600 /home/agent/.ssh/id_ed25519
+
+  # Ensure ssh uses this key for bitbucket.
+  if [[ ! -f /home/agent/.ssh/config ]] || ! grep -q "^Host bitbucket\.org$" /home/agent/.ssh/config; then
+    cat >>/home/agent/.ssh/config <<'EOF'
+Host bitbucket.org
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+EOF
+    chown agent:agent /home/agent/.ssh/config
+    chmod 0600 /home/agent/.ssh/config
+  fi
+
+  # Pre-seed known_hosts to avoid interactive prompts.
+  sudo -i -u agent bash -lc 'ssh-keygen -F bitbucket.org >/dev/null 2>&1 || ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts' || true
+  sudo -i -u agent bash -lc 'chmod 0644 ~/.ssh/known_hosts || true' || true
+
+  return 0
+}
+
+write_agent_repos_from_ssm() {
+  local region="$1"
+  local param_name="$2"
+
+  log "Fetching agentctl repos from SSM Parameter Store: $param_name"
+
+  install -d -m 0755 -o agent -g agent /home/agent/.config/agentctl
+
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! aws --region "$region" ssm get-parameter \
+    --name "$param_name" \
+    --with-decryption \
+    --query Parameter.Value --output text \
+    >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  mv "$tmp" /home/agent/.config/agentctl/repos.txt
+  chown agent:agent /home/agent/.config/agentctl/repos.txt
+  chmod 0644 /home/agent/.config/agentctl/repos.txt
+  return 0
+}
+
+maybe_load_remote_config() {
+  # Disabled unless explicitly enabled.
+  if [[ -z "${AGENT_HOST_CONFIG_NAME:-}" && -z "${BITBUCKET_SSH_KEY_SECRET_ID:-}" && -z "${AGENTCTL_REPOS_SSM_PARAM_NAME:-}" ]]; then
+    log "Remote config: disabled"
+    return 0
+  fi
+
+  if [[ -z "${BITBUCKET_SSH_KEY_SECRET_ID:-}" && -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
+    BITBUCKET_SSH_KEY_SECRET_ID="agent-host/${AGENT_HOST_CONFIG_NAME}/bitbucket_ssh_private_key"
+  fi
+
+  if [[ -z "${AGENTCTL_REPOS_SSM_PARAM_NAME:-}" && -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
+    AGENTCTL_REPOS_SSM_PARAM_NAME="/agent-host/${AGENT_HOST_CONFIG_NAME}/agentctl/repos_txt"
+  fi
+
+  local region
+  if ! region="$(detect_aws_region)"; then
+    if [[ "$REQUIRE_REMOTE_CONFIG" == "1" ]]; then
+      die "Remote config enabled but AWS region could not be detected (set REMOTE_CONFIG_AWS_REGION or ensure IMDS is available)."
+    fi
+    log "WARNING: Remote config enabled but region could not be detected; skipping."
+    return 0
+  fi
+
+  log "Remote config: enabled (region=$region config_name=${AGENT_HOST_CONFIG_NAME:-<custom>})"
+
+  local ok=0
+
+  if [[ -n "${BITBUCKET_SSH_KEY_SECRET_ID:-}" ]]; then
+    if write_agent_bitbucket_key_from_secret "$region" "$BITBUCKET_SSH_KEY_SECRET_ID"; then
+      ok=1
+    else
+      if [[ "$REQUIRE_REMOTE_CONFIG" == "1" ]]; then
+        die "Failed to load Bitbucket SSH key secret: $BITBUCKET_SSH_KEY_SECRET_ID"
+      fi
+      log "WARNING: Failed to load Bitbucket SSH key secret: $BITBUCKET_SSH_KEY_SECRET_ID"
+    fi
+  fi
+
+  if [[ -n "${AGENTCTL_REPOS_SSM_PARAM_NAME:-}" ]]; then
+    if write_agent_repos_from_ssm "$region" "$AGENTCTL_REPOS_SSM_PARAM_NAME"; then
+      ok=1
+    else
+      if [[ "$REQUIRE_REMOTE_CONFIG" == "1" ]]; then
+        die "Failed to load agentctl repos parameter: $AGENTCTL_REPOS_SSM_PARAM_NAME"
+      fi
+      log "WARNING: Failed to load agentctl repos parameter: $AGENTCTL_REPOS_SSM_PARAM_NAME"
+    fi
+  fi
+
+  if [[ "$ok" -eq 1 ]]; then
+    log "Remote config applied."
+  fi
+
+  return 0
+}
+
+################################################################################
+# 8) Layout under /srv and install agentctl
 ################################################################################
 setup_srv_layout() {
   log "Creating /srv layout..."
@@ -322,6 +520,10 @@ sanity_checks() {
 main() {
   mount_srv
   install_base
+
+  # Optional: pull shared config (Bitbucket key + repos list) from AWS so it persists across instances.
+  maybe_load_remote_config
+
   install_node
   install_ssm_agent
   configure_agent_path

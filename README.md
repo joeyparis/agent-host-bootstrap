@@ -63,6 +63,60 @@ Environment variables:
 - `INSTALL_GEMINI_CLI` (default: `1`)
 - `INSTALL_CLAUDE_CLI` (default: `1`)
 
+### Remote config (persist Bitbucket SSH key + agentctl repos across instances)
+By default, the bootstrap does NOT pull any shared configuration.
+
+To enable shared config for a given deployment, set a deployment-specific config name:
+- `AGENT_HOST_CONFIG_NAME=<name>`
+
+This lets you run multiple independent deployments that:
+- share the same config (use the same name), or
+- use different configs (different names)
+
+When `AGENT_HOST_CONFIG_NAME` is set, the bootstrap derives these default AWS resource names:
+- Secrets Manager (Bitbucket SSH private key): `agent-host/<name>/bitbucket_ssh_private_key`
+- SSM Parameter Store (agentctl `repos.txt`): `/agent-host/<name>/agentctl/repos_txt`
+
+You can override either name directly:
+- `BITBUCKET_SSH_KEY_SECRET_ID=...`
+- `AGENTCTL_REPOS_SSM_PARAM_NAME=...`
+
+Behavior:
+- `REQUIRE_REMOTE_CONFIG` (default: `1` when remote config is enabled)
+  - `1`: fail the bootstrap if the secret/parameter can’t be fetched
+  - `0`: log a warning and continue
+- `REMOTE_CONFIG_AWS_REGION` (optional): force the region used for AWS CLI calls
+
+Important:
+- This is an AWS account + region setup (Secrets Manager and SSM Parameter Store are region-scoped).
+- Instances fetch these values via their instance profile (IAM role).
+
+Required IAM permissions on the instance role:
+- `secretsmanager:GetSecretValue` for the Bitbucket key secret
+- `ssm:GetParameter` for the repos parameter
+- plus `kms:Decrypt` if you use customer-managed KMS keys
+
+Example setup (run from a workstation/CI with AWS creds):
+```bash
+# Choose a config name (e.g. prod, staging, joey)
+CFG=my-config
+REGION=us-east-1
+
+# 1) Create/update the Bitbucket SSH private key secret
+# Store the private key file (e.g. id_ed25519) as secret-binary.
+# If it already exists, use `aws secretsmanager update-secret` instead of `create-secret`.
+aws --region "$REGION" secretsmanager create-secret \
+  --name "agent-host/${CFG}/bitbucket_ssh_private_key" \
+  --secret-binary fileb://id_ed25519
+
+# 2) Create/update the agentctl repos list
+aws --region "$REGION" ssm put-parameter \
+  --name "/agent-host/${CFG}/agentctl/repos_txt" \
+  --type String \
+  --value "$(cat repos.txt)" \
+  --overwrite
+```
+
 ## Using agentctl
 After provisioning:
 ```bash
