@@ -4,7 +4,7 @@ set -euo pipefail
 ################################################################################
 # CONFIG: set these to your bootstrap repo where agentctl lives
 ################################################################################
-GITHUB_OWNER="YOUR_GITHUB_USER_OR_ORG"
+GITHUB_OWNER="joeyparis"
 GITHUB_REPO="agent-host-bootstrap"
 GITHUB_REF="main"
 
