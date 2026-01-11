@@ -478,8 +478,10 @@ write_agent_bitbucket_mcp_env_from_secret() {
   install -d -m 0755 -o agent -g agent /home/agent/.config/agentctl/mcp
 
   # Write an env file (chmod 600) that will be sourced for the agent user.
-  # Expected JSON keys:
-  #   BITBUCKET_WORKSPACE, BITBUCKET_USERNAME, BITBUCKET_PASSWORD
+  # Expected JSON keys (preferred):
+  #   BITBUCKET_WORKSPACE, BITBUCKET_TOKEN
+  # Alternative/basic auth keys:
+  #   BITBUCKET_USERNAME (or BITBUCKET_EMAIL), BITBUCKET_PASSWORD
   # Optional:
   #   BITBUCKET_URL
   python3 - <<'PY' <<<"$secret_json" > /home/agent/.config/agentctl/mcp/bitbucket.env
@@ -487,13 +489,28 @@ import json,sys,shlex
 raw = sys.stdin.read()
 data = json.loads(raw)
 
-def get(key):
-    return data.get(key) or data.get(key.lower())
+def first(*keys):
+    for k in keys:
+        if k in data and data[k] not in (None, ""):
+            return data[k]
+        lk = k.lower()
+        if lk in data and data[lk] not in (None, ""):
+            return data[lk]
+    return None
 
-keys = ["BITBUCKET_WORKSPACE","BITBUCKET_USERNAME","BITBUCKET_PASSWORD","BITBUCKET_URL"]
-for k in keys:
-    v = get(k)
-    if v is None or v == "":
+exports = {}
+exports["BITBUCKET_WORKSPACE"] = first("BITBUCKET_WORKSPACE")
+exports["BITBUCKET_URL"] = first("BITBUCKET_URL")
+
+# Token-based auth (preferred)
+exports["BITBUCKET_TOKEN"] = first("BITBUCKET_TOKEN")
+
+# Basic auth fallback
+exports["BITBUCKET_USERNAME"] = first("BITBUCKET_USERNAME", "BITBUCKET_EMAIL", "EMAIL")
+exports["BITBUCKET_PASSWORD"] = first("BITBUCKET_PASSWORD")
+
+for k, v in exports.items():
+    if v is None:
         continue
     print(f"export {k}={shlex.quote(str(v))}")
 PY
@@ -537,7 +554,7 @@ configure_bitbucket_mcp_for_agent_clis() {
 command = "${BITBUCKET_MCP_COMMAND}"
 args = ["${BITBUCKET_MCP_ARGS[0]}", "${BITBUCKET_MCP_ARGS[1]}"]
 # Forward these vars from the current environment into the MCP server process.
-env_vars = ["BITBUCKET_WORKSPACE", "BITBUCKET_USERNAME", "BITBUCKET_PASSWORD", "BITBUCKET_URL"]
+env_vars = ["BITBUCKET_WORKSPACE", "BITBUCKET_TOKEN", "BITBUCKET_USERNAME", "BITBUCKET_PASSWORD", "BITBUCKET_URL"]
 startup_timeout_sec = 20
 EOF
     chown agent:agent "$codex_cfg"
@@ -561,7 +578,14 @@ EOF
       .mcpServers = (.mcpServers // {})
       | .mcpServers.bitbucket = {
           command: $cmd,
-          args: [$a0, $a1]
+          args: [$a0, $a1],
+          env: {
+            BITBUCKET_WORKSPACE: "${BITBUCKET_WORKSPACE}",
+            BITBUCKET_TOKEN: "${BITBUCKET_TOKEN}",
+            BITBUCKET_USERNAME: "${BITBUCKET_USERNAME}",
+            BITBUCKET_PASSWORD: "${BITBUCKET_PASSWORD}",
+            BITBUCKET_URL: "${BITBUCKET_URL}"
+          }
         }
      ' "$gemini_cfg" >"$tmp" || { rm -f "$tmp"; return 0; }
   mv "$tmp" "$gemini_cfg"

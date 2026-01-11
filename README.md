@@ -163,11 +163,22 @@ scripts/create_agent_host_remote_config.sh \
 ```
 
 Example `bitbucket_mcp_credentials.json` (stored in Secrets Manager as SecretString):
+
+Preferred (token-based):
 ```json
 {
   "BITBUCKET_WORKSPACE": "TouchFuse",
-  "BITBUCKET_USERNAME": "<bitbucket_username>",
-  "BITBUCKET_PASSWORD": "<bitbucket_app_password>",
+  "BITBUCKET_TOKEN": "<bitbucket_api_token>",
+  "BITBUCKET_URL": "https://api.bitbucket.org/2.0"
+}
+```
+
+Fallback (basic auth style):
+```json
+{
+  "BITBUCKET_WORKSPACE": "TouchFuse",
+  "BITBUCKET_USERNAME": "<bitbucket_email_or_username>",
+  "BITBUCKET_PASSWORD": "<bitbucket_app_password_or_token>",
   "BITBUCKET_URL": "https://api.bitbucket.org/2.0"
 }
 ```
