@@ -55,6 +55,15 @@ AGENT_HOST_CONFIG_NAME="${AGENT_HOST_CONFIG_NAME:-}"
 BITBUCKET_SSH_KEY_SECRET_ID="${BITBUCKET_SSH_KEY_SECRET_ID:-}"
 AGENTCTL_REPOS_SSM_PARAM_NAME="${AGENTCTL_REPOS_SSM_PARAM_NAME:-}"
 
+# Optional: Bitbucket MCP credentials secret (for Codex/Gemini/Claude tool integrations).
+# Default when AGENT_HOST_CONFIG_NAME is set:
+#   agent-host/<name>/bitbucket_mcp_credentials
+BITBUCKET_MCP_CREDENTIALS_SECRET_ID="${BITBUCKET_MCP_CREDENTIALS_SECRET_ID:-}"
+
+# Command used by CLIs to start the Bitbucket MCP server locally (stdio) on the instance.
+BITBUCKET_MCP_COMMAND="${BITBUCKET_MCP_COMMAND:-npx}"
+BITBUCKET_MCP_ARGS=("-y" "bitbucket-mcp@latest")
+
 # If enabled and this is 1, failing to fetch/apply remote config will fail the bootstrap.
 REQUIRE_REMOTE_CONFIG="${REQUIRE_REMOTE_CONFIG:-1}"
 
@@ -451,6 +460,117 @@ write_agent_repos_from_ssm() {
   return 0
 }
 
+write_agent_bitbucket_mcp_env_from_secret() {
+  local region="$1"
+  local secret_id="$2"
+
+  log "Fetching Bitbucket MCP credentials from Secrets Manager: $secret_id"
+
+  local secret_json
+  secret_json="$(aws --region "$region" secretsmanager get-secret-value \
+    --secret-id "$secret_id" \
+    --query SecretString --output text 2>/dev/null || true)"
+
+  if [[ -z "${secret_json:-}" || "$secret_json" == "None" ]]; then
+    return 1
+  fi
+
+  install -d -m 0755 -o agent -g agent /home/agent/.config/agentctl/mcp
+
+  # Write an env file (chmod 600) that will be sourced for the agent user.
+  # Expected JSON keys:
+  #   BITBUCKET_WORKSPACE, BITBUCKET_USERNAME, BITBUCKET_PASSWORD
+  # Optional:
+  #   BITBUCKET_URL
+  python3 - <<'PY' <<<"$secret_json" > /home/agent/.config/agentctl/mcp/bitbucket.env
+import json,sys,shlex
+raw = sys.stdin.read()
+data = json.loads(raw)
+
+def get(key):
+    return data.get(key) or data.get(key.lower())
+
+keys = ["BITBUCKET_WORKSPACE","BITBUCKET_USERNAME","BITBUCKET_PASSWORD","BITBUCKET_URL"]
+for k in keys:
+    v = get(k)
+    if v is None or v == "":
+        continue
+    print(f"export {k}={shlex.quote(str(v))}")
+PY
+
+  chown agent:agent /home/agent/.config/agentctl/mcp/bitbucket.env
+  chmod 0600 /home/agent/.config/agentctl/mcp/bitbucket.env
+
+  # Source the env file automatically for the agent user on login shells.
+  if [[ ! -f /etc/profile.d/agent-mcp.sh ]]; then
+    cat >/etc/profile.d/agent-mcp.sh <<'EOF'
+# Load per-agent MCP env vars (kept in agent's home with 0600 perms).
+# This file contains no secrets.
+
+if [ "$(id -un 2>/dev/null)" = "agent" ] && [ -f "$HOME/.config/agentctl/mcp/bitbucket.env" ]; then
+  . "$HOME/.config/agentctl/mcp/bitbucket.env"
+fi
+EOF
+    chmod 0644 /etc/profile.d/agent-mcp.sh
+  fi
+
+  return 0
+}
+
+configure_bitbucket_mcp_for_agent_clis() {
+  # Configure Codex + Gemini to launch the Bitbucket MCP server locally.
+  # Credentials are provided via environment variables loaded by /etc/profile.d/agent-mcp.sh.
+
+  # Codex CLI: ~/.codex/config.toml
+  install -d -m 0700 -o agent -g agent /home/agent/.codex
+  local codex_cfg="/home/agent/.codex/config.toml"
+  if [[ ! -f "$codex_cfg" ]]; then
+    touch "$codex_cfg"
+    chown agent:agent "$codex_cfg"
+    chmod 0600 "$codex_cfg"
+  fi
+
+  if ! grep -q "^\[mcp_servers\.bitbucket\]$" "$codex_cfg" 2>/dev/null; then
+    cat >>"$codex_cfg" <<EOF
+
+[mcp_servers.bitbucket]
+command = "${BITBUCKET_MCP_COMMAND}"
+args = ["${BITBUCKET_MCP_ARGS[0]}", "${BITBUCKET_MCP_ARGS[1]}"]
+# Forward these vars from the current environment into the MCP server process.
+env_vars = ["BITBUCKET_WORKSPACE", "BITBUCKET_USERNAME", "BITBUCKET_PASSWORD", "BITBUCKET_URL"]
+startup_timeout_sec = 20
+EOF
+    chown agent:agent "$codex_cfg"
+    chmod 0600 "$codex_cfg"
+  fi
+
+  # Gemini CLI: ~/.gemini/settings.json
+  install -d -m 0700 -o agent -g agent /home/agent/.gemini
+  local gemini_cfg="/home/agent/.gemini/settings.json"
+  if [[ ! -f "$gemini_cfg" ]]; then
+    echo '{}' >"$gemini_cfg"
+    chown agent:agent "$gemini_cfg"
+    chmod 0600 "$gemini_cfg"
+  fi
+
+  tmp="$(mktemp)"
+  jq --arg cmd "$BITBUCKET_MCP_COMMAND" \
+     --arg a0 "${BITBUCKET_MCP_ARGS[0]}" \
+     --arg a1 "${BITBUCKET_MCP_ARGS[1]}" \
+     '
+      .mcpServers = (.mcpServers // {})
+      | .mcpServers.bitbucket = {
+          command: $cmd,
+          args: [$a0, $a1]
+        }
+     ' "$gemini_cfg" >"$tmp" || { rm -f "$tmp"; return 0; }
+  mv "$tmp" "$gemini_cfg"
+  chown agent:agent "$gemini_cfg"
+  chmod 0600 "$gemini_cfg"
+
+  return 0
+}
+
 maybe_load_remote_config() {
   # Disabled unless explicitly enabled.
   if [[ -z "${AGENT_HOST_CONFIG_NAME:-}" && -z "${BITBUCKET_SSH_KEY_SECRET_ID:-}" && -z "${AGENTCTL_REPOS_SSM_PARAM_NAME:-}" ]]; then
@@ -464,6 +584,10 @@ maybe_load_remote_config() {
 
   if [[ -z "${AGENTCTL_REPOS_SSM_PARAM_NAME:-}" && -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
     AGENTCTL_REPOS_SSM_PARAM_NAME="/agent-host/${AGENT_HOST_CONFIG_NAME}/agentctl/repos_txt"
+  fi
+
+  if [[ -z "${BITBUCKET_MCP_CREDENTIALS_SECRET_ID:-}" && -n "${AGENT_HOST_CONFIG_NAME:-}" ]]; then
+    BITBUCKET_MCP_CREDENTIALS_SECRET_ID="agent-host/${AGENT_HOST_CONFIG_NAME}/bitbucket_mcp_credentials"
   fi
 
   local region
@@ -498,6 +622,15 @@ maybe_load_remote_config() {
         die "Failed to load agentctl repos parameter: $AGENTCTL_REPOS_SSM_PARAM_NAME"
       fi
       log "WARNING: Failed to load agentctl repos parameter: $AGENTCTL_REPOS_SSM_PARAM_NAME"
+    fi
+  fi
+
+  # Optional Bitbucket MCP config (do not fail the whole bootstrap if missing).
+  if [[ -n "${BITBUCKET_MCP_CREDENTIALS_SECRET_ID:-}" ]]; then
+    if write_agent_bitbucket_mcp_env_from_secret "$region" "$BITBUCKET_MCP_CREDENTIALS_SECRET_ID"; then
+      configure_bitbucket_mcp_for_agent_clis || true
+    else
+      log "WARNING: Bitbucket MCP credentials secret not loaded: $BITBUCKET_MCP_CREDENTIALS_SECRET_ID"
     fi
   fi
 

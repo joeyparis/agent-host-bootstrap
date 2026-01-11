@@ -5,9 +5,12 @@ usage() {
   cat <<'EOF'
 Create/update an agent-host remote config in AWS (per account + region).
 
-This writes two resources used by bootstrap.sh when AGENT_HOST_CONFIG_NAME is set:
+This writes resources used by bootstrap.sh when AGENT_HOST_CONFIG_NAME is set:
 - Secrets Manager (Bitbucket SSH private key): agent-host/<name>/bitbucket_ssh_private_key
 - SSM Parameter Store (agentctl repos.txt):    /agent-host/<name>/agentctl/repos_txt
+
+Optionally, it can also create:
+- Secrets Manager (Bitbucket MCP credentials JSON): agent-host/<name>/bitbucket_mcp_credentials
 
 Usage:
   scripts/create_agent_host_remote_config.sh \
@@ -15,6 +18,7 @@ Usage:
     --region <aws_region> \
     --ssh-key-file /path/to/id_ed25519 \
     --repos-file /path/to/repos.txt \
+    [--bitbucket-mcp-credentials-file /path/to/bitbucket_mcp_credentials.json] \
     [--profile <aws_profile>] \
     [--kms-key-id <kms_key_id>] \
     [--param-type String|SecureString]
@@ -31,6 +35,7 @@ region=""
 profile=""
 ssh_key_file=""
 repos_file=""
+bitbucket_mcp_credentials_file=""
 kms_key_id=""
 param_type="String"
 
@@ -46,6 +51,8 @@ while [[ $# -gt 0 ]]; do
       ssh_key_file="$2"; shift 2 ;;
     --repos-file)
       repos_file="$2"; shift 2 ;;
+    --bitbucket-mcp-credentials-file)
+      bitbucket_mcp_credentials_file="$2"; shift 2 ;;
     --kms-key-id)
       kms_key_id="$2"; shift 2 ;;
     --param-type)
@@ -80,6 +87,11 @@ if [[ ! -f "$repos_file" ]]; then
   exit 1
 fi
 
+if [[ -n "${bitbucket_mcp_credentials_file:-}" && ! -f "$bitbucket_mcp_credentials_file" ]]; then
+  echo "ERROR: Bitbucket MCP credentials file not found: $bitbucket_mcp_credentials_file" >&2
+  exit 1
+fi
+
 if ! command -v aws >/dev/null 2>&1; then
   echo "ERROR: aws CLI not found." >&2
   exit 1
@@ -87,6 +99,7 @@ fi
 
 secret_id="agent-host/${config_name}/bitbucket_ssh_private_key"
 param_name="/agent-host/${config_name}/agentctl/repos_txt"
+bitbucket_mcp_secret_id="agent-host/${config_name}/bitbucket_mcp_credentials"
 
 aws_args=(--region "$region")
 if [[ -n "$profile" ]]; then
@@ -136,5 +149,40 @@ aws "${aws_args[@]}" ssm put-parameter \
   --value "$(cat "$repos_file")" \
   --overwrite \
   >/dev/null
+
+# 3) Optional: Bitbucket MCP credentials secret
+if [[ -n "${bitbucket_mcp_credentials_file:-}" ]]; then
+  echo "Creating/updating Bitbucket MCP credentials secret: $bitbucket_mcp_secret_id (region=$region)"
+
+  set +e
+  aws "${aws_args[@]}" secretsmanager describe-secret --secret-id "$bitbucket_mcp_secret_id" >/dev/null 2>&1
+  mcp_secret_exists=$?
+  set -e
+
+  if [[ $mcp_secret_exists -eq 0 ]]; then
+    if [[ -n "$kms_key_id" ]]; then
+      aws "${aws_args[@]}" secretsmanager update-secret \
+        --secret-id "$bitbucket_mcp_secret_id" \
+        --kms-key-id "$kms_key_id" \
+        --secret-string "$(cat "$bitbucket_mcp_credentials_file")" \
+        >/dev/null
+    else
+      aws "${aws_args[@]}" secretsmanager update-secret \
+        --secret-id "$bitbucket_mcp_secret_id" \
+        --secret-string "$(cat "$bitbucket_mcp_credentials_file")" \
+        >/dev/null
+    fi
+  else
+    create_args=(
+      secretsmanager create-secret
+      --name "$bitbucket_mcp_secret_id"
+      --secret-string "$(cat "$bitbucket_mcp_credentials_file")"
+    )
+    if [[ -n "$kms_key_id" ]]; then
+      create_args+=(--kms-key-id "$kms_key_id")
+    fi
+    aws "${aws_args[@]}" "${create_args[@]}" >/dev/null
+  fi
+fi
 
 echo "Done. Bootstrap can now use: AGENT_HOST_CONFIG_NAME=$config_name"

@@ -112,10 +112,12 @@ This lets you run multiple independent deployments that:
 When `AGENT_HOST_CONFIG_NAME` is set, the bootstrap derives these default AWS resource names:
 - Secrets Manager (Bitbucket SSH private key): `agent-host/<name>/bitbucket_ssh_private_key`
 - SSM Parameter Store (agentctl `repos.txt`): `/agent-host/<name>/agentctl/repos_txt`
+- Secrets Manager (Bitbucket MCP credentials JSON, optional): `agent-host/<name>/bitbucket_mcp_credentials`
 
-You can override either name directly:
+You can override names directly:
 - `BITBUCKET_SSH_KEY_SECRET_ID=...`
 - `AGENTCTL_REPOS_SSM_PARAM_NAME=...`
+- `BITBUCKET_MCP_CREDENTIALS_SECRET_ID=...`
 
 Behavior:
 - `REQUIRE_REMOTE_CONFIG` (default: `1` when remote config is enabled)
@@ -130,6 +132,14 @@ Post-launch syncing:
   - `/home/agent/.config/agentctl/remote_config_name`
   Then you can run `agentctl sync-config` with no args.
 
+Bitbucket MCP on the agent host:
+- The agent host can run a Bitbucket MCP server locally (stdio) via:
+  - `npx -y bitbucket-mcp@latest`
+- Codex/Gemini/Claude will launch the MCP server as a child process on-demand on the EC2 instance.
+- Bootstrap/`agentctl sync-config` writes the MCP env file here (0600 perms):
+  - `/home/agent/.config/agentctl/mcp/bitbucket.env`
+- Bootstrap also installs `/etc/profile.d/agent-mcp.sh` so the env vars load automatically for the `agent` user.
+
 Important:
 - This is an AWS account + region setup (Secrets Manager and SSM Parameter Store are region-scoped).
 - Instances fetch these values via their instance profile (IAM role).
@@ -137,6 +147,7 @@ Important:
 Required IAM permissions on the instance role:
 - `secretsmanager:GetSecretValue` for the Bitbucket key secret
 - `ssm:GetParameter` for the repos parameter
+- `secretsmanager:GetSecretValue` for the optional Bitbucket MCP credentials secret
 - plus `kms:Decrypt` if you use customer-managed KMS keys
 
 Example setup (run from a workstation/CI with AWS creds):
@@ -147,7 +158,18 @@ scripts/create_agent_host_remote_config.sh \
   --name my-config \
   --region us-east-1 \
   --ssh-key-file ./id_ed25519 \
-  --repos-file ./repos.txt
+  --repos-file ./repos.txt \
+  --bitbucket-mcp-credentials-file ./bitbucket_mcp_credentials.json
+```
+
+Example `bitbucket_mcp_credentials.json` (stored in Secrets Manager as SecretString):
+```json
+{
+  "BITBUCKET_WORKSPACE": "TouchFuse",
+  "BITBUCKET_USERNAME": "<bitbucket_username>",
+  "BITBUCKET_PASSWORD": "<bitbucket_app_password>",
+  "BITBUCKET_URL": "https://api.bitbucket.org/2.0"
+}
 ```
 
 Option B: run raw AWS CLI commands:
@@ -186,7 +208,7 @@ agentctl start <agent_name>
 agentctl list-agents
 agentctl list-repos
 
-# Pull Bitbucket SSH key + repos.txt from AWS (optional remote config)
+# Pull Bitbucket SSH key + repos.txt (+ optional MCP creds) from AWS
 agentctl sync-config [config_name] [--region us-east-1]
 ```
 
