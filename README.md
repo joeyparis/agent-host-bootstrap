@@ -154,11 +154,18 @@ Example setup (run from a workstation/CI with AWS creds):
 
 Option A: use the helper script in this repo:
 ```bash
+# You can pass any subset of these inputs; only the provided ones will be updated.
 scripts/create_agent_host_remote_config.sh \
   --name my-config \
   --region us-east-1 \
   --ssh-key-file ./id_ed25519 \
   --repos-file ./repos.txt \
+  --bitbucket-mcp-credentials-file ./bitbucket_mcp_credentials.json
+
+# Example: update ONLY Bitbucket MCP credentials (leave SSH key + repos untouched)
+scripts/create_agent_host_remote_config.sh \
+  --name my-config \
+  --region us-east-1 \
   --bitbucket-mcp-credentials-file ./bitbucket_mcp_credentials.json
 ```
 
