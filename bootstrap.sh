@@ -234,9 +234,9 @@ install_awscli() {
 
   command -v aws >/dev/null 2>&1 || die "AWS CLI install failed"
 }
-
 install_base() {
   log "Installing base packages..."
+
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
   apt-get install -y \
@@ -255,6 +255,30 @@ install_base() {
 agent ALL=(ALL) NOPASSWD:ALL
 EOF
   chmod 0440 /etc/sudoers.d/agent
+}
+
+repair_sudo_ownership() {
+  # Some custom AMIs/snapshots can end up with incorrect ownership on sudo config files.
+  # sudo refuses to run unless these are owned by root.
+  if [[ -f /etc/sudo.conf ]]; then
+    chown root:root /etc/sudo.conf 2>/dev/null || true
+    chmod 0644 /etc/sudo.conf 2>/dev/null || true
+  fi
+
+  if [[ -f /etc/sudoers ]]; then
+    chown root:root /etc/sudoers 2>/dev/null || true
+    chmod 0440 /etc/sudoers 2>/dev/null || true
+  fi
+
+  if [[ -d /etc/sudoers.d ]]; then
+    chown root:root /etc/sudoers.d 2>/dev/null || true
+    chmod 0755 /etc/sudoers.d 2>/dev/null || true
+  fi
+
+  # Log a warning if sudo still can't run after repair.
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n true >/dev/null 2>&1 || log "WARNING: sudo still failing after ownership repair (check /etc/sudo.conf and /etc/sudoers)"
+  fi
 }
 
 ################################################################################
@@ -728,9 +752,9 @@ EOF
 ################################################################################
 sanity_checks() {
   log "Sanity checks..."
-  sudo -i -u agent bash -lc 'command -v codex && codex --help >/dev/null || true'
-  sudo -i -u agent bash -lc 'command -v gemini && gemini --help >/dev/null || true'
-  sudo -i -u agent bash -lc 'command -v claude && claude --help >/dev/null || true'
+  sudo -i -u agent bash -lc 'command -v codex && codex --help >/dev/null || true' || true
+  sudo -i -u agent bash -lc 'command -v gemini && gemini --help >/dev/null || true' || true
+  sudo -i -u agent bash -lc 'command -v claude && claude --help >/dev/null || true' || true
   command -v agentctl >/dev/null 2>&1 || die "agentctl not found after install"
 
   log "Done."
@@ -746,6 +770,9 @@ sanity_checks() {
 main() {
   mount_srv
   install_base
+
+  # Ensure sudo works before we use it to run any "as agent" steps.
+  repair_sudo_ownership
 
   # Optional: pull shared config (Bitbucket key + repos list) from AWS so it persists across instances.
   maybe_load_remote_config
