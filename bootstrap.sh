@@ -265,14 +265,38 @@ stat_uid() {
   fi
 }
 
+stat_mode() {
+  # Print file mode (octal perms, e.g. 4755) or empty.
+  local p="$1"
+  if command -v stat >/dev/null 2>&1; then
+    stat -c '%a' "$p" 2>/dev/null || true
+  fi
+}
+
 repair_sudo_ownership() {
   # Some custom AMIs/snapshots can end up with incorrect ownership on sudo config files.
   # sudo refuses to run unless these are owned by root.
   log "Repairing sudo config ownership (if needed)..."
 
+  # First, fix the sudo binary itself (must be root-owned + setuid).
+  # If /usr/bin/sudo loses setuid, sudo will not work regardless of sudoers config.
+  if [[ -f /usr/bin/sudo ]]; then
+    chown root:root /usr/bin/sudo 2>/dev/null || true
+    chmod 4755 /usr/bin/sudo 2>/dev/null || true
+
+    local uid mode
+    uid="$(stat_uid /usr/bin/sudo)"
+    mode="$(stat_mode /usr/bin/sudo)"
+    if [[ -n "${uid:-}" && "$uid" != "0" ]]; then
+      log "WARNING: /usr/bin/sudo uid is still $uid (expected 0)"
+    fi
+    if [[ -n "${mode:-}" && "$mode" != "4755" ]]; then
+      log "WARNING: /usr/bin/sudo mode is $mode (expected 4755)"
+    fi
+  fi
+
   if [[ -f /etc/sudo.conf ]]; then
-    local before after
-    before="$(stat_uid /etc/sudo.conf)"
+    local after
     chown root:root /etc/sudo.conf 2>/dev/null || true
     chmod 0644 /etc/sudo.conf 2>/dev/null || true
     after="$(stat_uid /etc/sudo.conf)"
@@ -282,8 +306,7 @@ repair_sudo_ownership() {
   fi
 
   if [[ -f /etc/sudoers ]]; then
-    local before after
-    before="$(stat_uid /etc/sudoers)"
+    local after
     chown root:root /etc/sudoers 2>/dev/null || true
     chmod 0440 /etc/sudoers 2>/dev/null || true
     after="$(stat_uid /etc/sudoers)"
