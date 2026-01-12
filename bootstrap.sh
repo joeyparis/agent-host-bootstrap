@@ -295,6 +295,27 @@ repair_sudo_ownership() {
   if [[ -d /etc/sudoers.d ]]; then
     chown root:root /etc/sudoers.d 2>/dev/null || true
     chmod 0755 /etc/sudoers.d 2>/dev/null || true
+
+    # Fix ownership/perms of sudoers include files too.
+    # sudo will refuse to run if any sudoers.d file is not owned by root.
+    shopt -s nullglob
+    local f
+    for f in /etc/sudoers.d/*; do
+      [[ -f "$f" ]] || continue
+      chown root:root "$f" 2>/dev/null || true
+      chmod 0440 "$f" 2>/dev/null || true
+      local uid
+      uid="$(stat_uid "$f")"
+      if [[ -n "${uid:-}" && "$uid" != "0" ]]; then
+        log "WARNING: $f uid is still $uid (expected 0)"
+      fi
+    done
+    shopt -u nullglob
+  fi
+
+  # Quietly verify sudo usability after repair.
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n true >/dev/null 2>&1 || log "WARNING: sudo still failing after ownership repair"
   fi
 }
 
@@ -817,7 +838,7 @@ sanity_checks() {
   command -v agentctl >/dev/null 2>&1 || die "agentctl not found after install"
 
   log "Done."
-  log "Next: sudo -i -u agent"
+  log "Next: sudo -i -u agent (or: su - agent if sudo is broken)"
   log "Then: agentctl session"
   log "Note: If arrow keys print ^[[A in SSM Session Manager, that's because SSM defaults to /bin/sh." 
   log "      Fix is an AWS Session Manager preference (account+region). See: scripts/configure_ssm_shell_profile.sh in this repo."
