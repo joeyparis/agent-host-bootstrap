@@ -211,8 +211,11 @@ write_bitbucket_mcp_env_from_secret() {
   chmod 0700 "$(dirname "$env_file")" 2>/dev/null || true
 
   # Convert JSON -> bash exports with safe quoting.
-  python3 - <<'PY' <<<"$secret_json" >"$env_file"
-import json,sys,shlex
+  # Write atomically (avoid leaving an empty file if parsing fails).
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! python3 -c 'import json,sys,shlex
 raw = sys.stdin.read()
 data = json.loads(raw)
 
@@ -241,8 +244,13 @@ for k, v in exports.items():
     if v is None:
         continue
     print(f"export {k}={shlex.quote(str(v))}")
-PY
+' <<<"$secret_json" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
 
+  chmod 0600 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$env_file"
   chmod 0600 "$env_file" 2>/dev/null || true
   return 0
 }

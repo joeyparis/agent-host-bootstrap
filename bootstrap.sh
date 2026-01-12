@@ -508,8 +508,12 @@ write_agent_bitbucket_mcp_env_from_secret() {
   #   BITBUCKET_USERNAME (or BITBUCKET_EMAIL), BITBUCKET_PASSWORD
   # Optional:
   #   BITBUCKET_URL
-  python3 - <<'PY' <<<"$secret_json" > /home/agent/.config/agentctl/mcp/bitbucket.env
-import json,sys,shlex
+  #
+  # Write atomically (avoid leaving an empty file if parsing fails).
+  local tmp
+  tmp="$(mktemp)"
+
+  if ! python3 -c 'import json,sys,shlex
 raw = sys.stdin.read()
 data = json.loads(raw)
 
@@ -537,8 +541,12 @@ for k, v in exports.items():
     if v is None:
         continue
     print(f"export {k}={shlex.quote(str(v))}")
-PY
+' <<<"$secret_json" >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
 
+  mv -f "$tmp" /home/agent/.config/agentctl/mcp/bitbucket.env
   chown agent:agent /home/agent/.config/agentctl/mcp/bitbucket.env
   chmod 0600 /home/agent/.config/agentctl/mcp/bitbucket.env
 
