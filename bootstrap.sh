@@ -257,28 +257,74 @@ EOF
   chmod 0440 /etc/sudoers.d/agent
 }
 
+stat_uid() {
+  # Print file uid or empty.
+  local p="$1"
+  if command -v stat >/dev/null 2>&1; then
+    stat -c '%u' "$p" 2>/dev/null || true
+  fi
+}
+
 repair_sudo_ownership() {
   # Some custom AMIs/snapshots can end up with incorrect ownership on sudo config files.
   # sudo refuses to run unless these are owned by root.
+  log "Repairing sudo config ownership (if needed)..."
+
   if [[ -f /etc/sudo.conf ]]; then
+    local before after
+    before="$(stat_uid /etc/sudo.conf)"
     chown root:root /etc/sudo.conf 2>/dev/null || true
     chmod 0644 /etc/sudo.conf 2>/dev/null || true
+    after="$(stat_uid /etc/sudo.conf)"
+    if [[ -n "${after:-}" && "$after" != "0" ]]; then
+      log "WARNING: /etc/sudo.conf uid is still $after (expected 0)"
+    fi
   fi
 
   if [[ -f /etc/sudoers ]]; then
+    local before after
+    before="$(stat_uid /etc/sudoers)"
     chown root:root /etc/sudoers 2>/dev/null || true
     chmod 0440 /etc/sudoers 2>/dev/null || true
+    after="$(stat_uid /etc/sudoers)"
+    if [[ -n "${after:-}" && "$after" != "0" ]]; then
+      log "WARNING: /etc/sudoers uid is still $after (expected 0)"
+    fi
   fi
 
   if [[ -d /etc/sudoers.d ]]; then
     chown root:root /etc/sudoers.d 2>/dev/null || true
     chmod 0755 /etc/sudoers.d 2>/dev/null || true
   fi
+}
 
-  # Log a warning if sudo still can't run after repair.
+run_as_agent() {
+  # Run a command as the 'agent' user in a login shell.
+  # Prefer sudo, but fall back to runuser/su if sudo itself is broken.
   if command -v sudo >/dev/null 2>&1; then
-    sudo -n true >/dev/null 2>&1 || log "WARNING: sudo still failing after ownership repair (check /etc/sudo.conf and /etc/sudoers)"
+    if sudo -n true >/dev/null 2>&1; then
+      sudo -i -u agent "$@"
+      return $?
+    fi
   fi
+
+  if command -v runuser >/dev/null 2>&1; then
+    local q=()
+    local a
+    for a in "$@"; do
+      q+=("$(printf '%q' "$a")")
+    done
+    runuser -l agent -c "${q[*]}"
+    return $?
+  fi
+
+  # Fallback (should exist on most distros)
+  local q=()
+  local a
+  for a in "$@"; do
+    q+=("$(printf '%q' "$a")")
+  done
+  su - agent -c "${q[*]}"
 }
 
 ################################################################################
@@ -337,21 +383,22 @@ EOF
 
 install_agent_clis() {
   log "Configuring npm global prefix for agent (avoid /usr permission issues)..."
-  sudo -i -u agent bash -lc 'mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global' || log "WARNING: Failed to configure npm global prefix for agent"
+  # If sudo is broken on the base image, still try to proceed using runuser/su.
+  run_as_agent bash -lc 'mkdir -p ~/.npm-global && npm config set prefix ~/.npm-global' || log "WARNING: Failed to configure npm global prefix for agent"
 
   if [[ "$INSTALL_CODEX_CLI" == "1" ]]; then
     log "Installing Codex CLI as agent (best effort)..."
-    sudo -i -u agent bash -lc 'npm install -g @openai/codex' || log "WARNING: Codex CLI install failed"
+    run_as_agent bash -lc 'npm install -g @openai/codex' || log "WARNING: Codex CLI install failed"
   fi
 
   if [[ "$INSTALL_GEMINI_CLI" == "1" ]]; then
     log "Installing Gemini CLI as agent (best effort)..."
-    sudo -i -u agent bash -lc 'npm install -g @google/gemini-cli' || log "WARNING: Gemini CLI install failed"
+    run_as_agent bash -lc 'npm install -g @google/gemini-cli' || log "WARNING: Gemini CLI install failed"
   fi
 
   if [[ "$INSTALL_CLAUDE_CLI" == "1" ]]; then
     log "Installing Claude CLI as agent (best effort)..."
-    sudo -i -u agent bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' || log "WARNING: Claude CLI install failed"
+    run_as_agent bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' || log "WARNING: Claude CLI install failed"
   fi
 }
 
@@ -452,8 +499,8 @@ EOF
   fi
 
   # Pre-seed known_hosts to avoid interactive prompts.
-  sudo -i -u agent bash -lc 'ssh-keygen -F bitbucket.org >/dev/null 2>&1 || ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts' || true
-  sudo -i -u agent bash -lc 'chmod 0644 ~/.ssh/known_hosts || true' || true
+  run_as_agent bash -lc 'ssh-keygen -F bitbucket.org >/dev/null 2>&1 || ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts' || true
+  run_as_agent bash -lc 'chmod 0644 ~/.ssh/known_hosts || true' || true
 
   return 0
 }
@@ -760,9 +807,13 @@ EOF
 ################################################################################
 sanity_checks() {
   log "Sanity checks..."
-  sudo -i -u agent bash -lc 'command -v codex && codex --help >/dev/null || true' || true
-  sudo -i -u agent bash -lc 'command -v gemini && gemini --help >/dev/null || true' || true
-  sudo -i -u agent bash -lc 'command -v claude && claude --help >/dev/null || true' || true
+
+  # Ensure sudo config is sane before we suggest using sudo interactively.
+  repair_sudo_ownership
+
+  run_as_agent bash -lc 'command -v codex && codex --help >/dev/null || true' || true
+  run_as_agent bash -lc 'command -v gemini && gemini --help >/dev/null || true' || true
+  run_as_agent bash -lc 'command -v claude && claude --help >/dev/null || true' || true
   command -v agentctl >/dev/null 2>&1 || die "agentctl not found after install"
 
   log "Done."
@@ -780,6 +831,7 @@ main() {
   install_base
 
   # Ensure sudo works before we use it to run any "as agent" steps.
+  # (We also fall back to runuser/su when sudo is broken.)
   repair_sudo_ownership
 
   # Optional: pull shared config (Bitbucket key + repos list) from AWS so it persists across instances.
