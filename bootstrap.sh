@@ -41,6 +41,14 @@ INSTALL_GEMINI_CLI="${INSTALL_GEMINI_CLI:-1}"
 INSTALL_CLAUDE_CLI="${INSTALL_CLAUDE_CLI:-1}"
 
 ################################################################################
+# CONFIG: apt/dpkg lock wait behavior
+################################################################################
+# Ubuntu images may have unattended-upgrades/cloud-init apt tasks running during boot.
+# These can hold apt/dpkg locks briefly and cause bootstrap to fail unless we retry.
+APT_LOCK_WAIT_SECONDS="${APT_LOCK_WAIT_SECONDS:-600}"
+APT_LOCK_WAIT_INTERVAL="${APT_LOCK_WAIT_INTERVAL:-3}"
+
+################################################################################
 # CONFIG: optional remote config (persist outside instances)
 ################################################################################
 # To enable, set AGENT_HOST_CONFIG_NAME to a non-empty value.
@@ -76,6 +84,56 @@ raw_url() {
 
 log() { echo "[$(date -Is)] $*"; }
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+is_apt_lock_error() {
+  # Detect the common lock errors from apt/dpkg.
+  grep -qE 'Could not get lock|Unable to lock directory|Unable to acquire the dpkg frontend lock|Could not open lock file' 2>/dev/null
+}
+
+retry_on_apt_lock() {
+  # Run an arbitrary command; if it fails due to apt/dpkg locks, wait+retry.
+  # Usage: retry_on_apt_lock <label> <command...>
+  local label="$1"; shift
+
+  local loops
+  loops=$((APT_LOCK_WAIT_SECONDS / APT_LOCK_WAIT_INTERVAL))
+  [[ "$loops" -lt 1 ]] && loops=1
+
+  local tmp
+  tmp="$(mktemp)"
+
+  for i in $(seq 1 "$loops"); do
+    set +e
+    "$@" >"$tmp" 2>&1
+    local rc=$?
+    set -e
+
+    if [[ $rc -eq 0 ]]; then
+      cat "$tmp"
+      rm -f "$tmp"
+      return 0
+    fi
+
+    if is_apt_lock_error <"$tmp"; then
+      log "$label: apt/dpkg locked; retrying in ${APT_LOCK_WAIT_INTERVAL}s ($i/$loops)"
+      sleep "$APT_LOCK_WAIT_INTERVAL"
+      continue
+    fi
+
+    cat "$tmp" >&2
+    rm -f "$tmp"
+    return $rc
+  done
+
+  cat "$tmp" >&2
+  rm -f "$tmp"
+  die "$label: timed out waiting for apt/dpkg locks after ${APT_LOCK_WAIT_SECONDS}s"
+}
+
+apt_get() {
+  # Wrapper for apt-get that retries on lock contention.
+  retry_on_apt_lock "apt-get $*" apt-get "$@"
+}
 
 ################################################################################
 # 1) Find the data device (prefer /dev/sdb)
@@ -195,15 +253,15 @@ install_awscli() {
 
   # On Ubuntu, awscli is commonly in the 'universe' component.
   if [[ -r /etc/os-release ]] && grep -q '^ID=ubuntu' /etc/os-release; then
-    apt-get install -y software-properties-common >/dev/null 2>&1 || true
+    apt_get install -y software-properties-common >/dev/null 2>&1 || true
     if command -v add-apt-repository >/dev/null 2>&1; then
       add-apt-repository -y universe >/dev/null 2>&1 || true
-      apt-get update
+      apt_get update
     fi
   fi
 
   # Try apt first.
-  if apt-get install -y awscli >/dev/null 2>&1; then
+  if apt_get install -y awscli >/dev/null 2>&1; then
     return 0
   fi
 
@@ -238,8 +296,8 @@ install_base() {
   log "Installing base packages..."
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y \
+  apt_get update
+  apt_get install -y \
     tmux git zsh curl ca-certificates gnupg jq unzip ripgrep \
     build-essential python3 python3-pip \
     openssh-client
@@ -376,8 +434,10 @@ run_as_agent() {
 ################################################################################
 install_node() {
   log "Installing Node.js 22..."
-  curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-  apt-get install -y nodejs
+
+  # NodeSource setup script uses apt under the hood; it can fail if apt/dpkg are locked.
+  retry_on_apt_lock "nodesource setup" bash -lc 'curl -fsSL https://deb.nodesource.com/setup_22.x | bash -'
+  apt_get install -y nodejs
 }
 
 ################################################################################
@@ -400,7 +460,7 @@ install_ssm_agent() {
 
   # Fallback: some distros/AMIs expose amazon-ssm-agent as an apt package.
   if apt-cache show amazon-ssm-agent >/dev/null 2>&1; then
-    apt-get install -y amazon-ssm-agent || { log "WARNING: Failed to install amazon-ssm-agent via apt"; return 0; }
+    apt_get install -y amazon-ssm-agent || { log "WARNING: Failed to install amazon-ssm-agent via apt"; return 0; }
     systemctl enable --now amazon-ssm-agent.service || true
     return 0
   fi
